@@ -51,6 +51,7 @@ public final class MessageParser {
     private var state: State = .ready
     private var context = Context()
     private var buffer: [UInt8] = []
+    private var reasonPhrase: String = ""
     
     private var messages: [Message] = []
     
@@ -108,8 +109,51 @@ public final class MessageParser {
             processedCount = bytes.baseAddress!.withMemoryRebound(to: Int8.self, capacity: bytes.count) {
                 return http_parser_execute(&self.parser, &self.parserSettings, $0, bytes.count)
             }
+            
+
+            context.status = Response.Status(
+                statusCode: Int(parser.status_code),
+                reasonPhrase: reasonPhrase
+            )
+
+        if state == .messageComplete {
+            let message: Message
+            switch mode {
+            case .request:
+                var request = Request(
+                    method: Request.Method(code: http_method(rawValue: parser.method)),
+                    url: context.url!,
+                    headers: Headers(),
+                    body: .buffer(context.body)
+                )
+                
+                request.headers = Headers(context.headers)
+                message = request
+            case .response:
+                let cookieHeaders =
+                    self.context.headers
+                        .filter { $0.key == "Set-Cookie" }
+                        .map { $0.value }
+                        .reduce(Set<String>()) { initial, value in
+                            return initial.union(Set(value.components(separatedBy: ", ")))
+                }
+                
+                let response = Response(
+                    version: Version(major: Int(parser.http_major), minor: Int(parser.http_minor)),
+                    status: context.status!,
+                    headers: Headers(context.headers),
+                    cookieHeaders: cookieHeaders,
+                    body: .buffer(context.body)
+                )
+                
+                message = response
+            }
+            
+            messages.append(message)
+            context = Context()
         }
-        
+        }
+
         guard processedCount == bytes.count else {
             throw MessageParserError(parser.http_errno)
         }
@@ -179,11 +223,8 @@ public final class MessageParser {
                 let string = buffer.withUnsafeBufferPointer { (ptr: UnsafeBufferPointer<UInt8>) -> String in
                     return String(cString: ptr.baseAddress!)
                 }
+                reasonPhrase = string
 
-                context.status = Response.Status(
-                    statusCode: Int(parser.status_code),
-                    reasonPhrase: string
-                )
             case .headerField:
                 buffer.append(0)
 
@@ -202,8 +243,6 @@ public final class MessageParser {
                 context.addValueForCurrentHeaderField(string)
             case .headersComplete:
                 context.currentHeaderField = nil
-                context.method = Request.Method(code: http_method(rawValue: parser.method))
-                context.version = Version(major: Int(parser.http_major), minor: Int(parser.http_minor))
             case .body:
                 context.body = Buffer(buffer)
             }
@@ -211,44 +250,7 @@ public final class MessageParser {
             buffer = []
             state = newState
             
-            if state == .messageComplete {
-                let message: Message
-                switch mode {
-                case .request:
-                    var request = Request(
-                        method: context.method!,
-                        url: context.url!,
-                        headers: Headers(),
-                        body: .buffer(context.body)
-                    )
-
-                    request.headers = Headers(context.headers)
-                    message = request
-                case .response:
-                    let cookieHeaders =
-                        self.context.headers
-                            .filter { $0.key == "Set-Cookie" }
-                            .map { $0.value }
-                            .reduce(Set<String>()) { initial, value in
-                                return initial.union(Set(value.components(separatedBy: ", ")))
-                    }
-                    
-                    let response = Response(
-                        version: context.version!,
-                        status: context.status!,
-                        headers: Headers(context.headers),
-                        cookieHeaders: cookieHeaders,
-                        body: .buffer(context.body)
-                    )
-                    
-                    message = response
-                }
-                
-                messages.append(message)
-                context = Context()
-            }
         }
-
         guard let data = data, data.count > 0 else {
             return 0
         }
@@ -258,7 +260,6 @@ public final class MessageParser {
                 self.buffer.append(ptr[i])
             }
         }
-
         return 0
     }
 }
